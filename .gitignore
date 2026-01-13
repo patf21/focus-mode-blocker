@@ -1,0 +1,27 @@
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App runtime artifacts (your script creates these)
+focusmode.stop
+focusmode.heartbeat
+hosts.focus_backup
+policies.json.focus_backup
+hosts.focus_recovery
+firefox_policy_recovery
