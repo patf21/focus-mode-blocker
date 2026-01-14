@@ -52,29 +52,68 @@ BLOCKED_DOMAINS = [
 
     # Instagram
     "instagram.com", "www.instagram.com", "*.instagram.com",
+
+    # Reddit
+    "reddit.com", "www.reddit.com", "*.reddit.com",
+    "old.reddit.com", "new.reddit.com",
+    "redd.it", "*.redd.it",
+
+    # LinkedIn
+    "linkedin.com", "www.linkedin.com", "*.linkedin.com",
+    "lnkd.in",
 ]
 
+
 HOSTS_BLOCK_ENTRIES = [
+    # YouTube
     "youtube.com",
     "www.youtube.com",
     "m.youtube.com",
     "youtu.be",
     "googlevideo.com",
     "ytimg.com",
+
+    # Instagram
     "instagram.com",
     "www.instagram.com",
     "graph.instagram.com",
     "cdninstagram.com",
+
+    # Reddit
+    "reddit.com",
+    "www.reddit.com",
+    "old.reddit.com",
+    "new.reddit.com",
+    "redd.it",
+
+    # LinkedIn
+    "linkedin.com",
+    "www.linkedin.com",
+    "lnkd.in",
 ]
 
+
 SITE_DATA_DOMAINS = [
+    # YouTube
     "youtube.com",
     "googlevideo.com",
     "ytimg.com",
+
+    # Discord
     "discord.com",
     "discord.gg",
+
+    # Instagram
     "instagram.com",
+
+    # Reddit
+    "reddit.com",
+    "redd.it",
+
+    # LinkedIn
+    "linkedin.com",
 ]
+
 
 KILL_DISCORD_APP = True
 BLOCKED_PROCESSES = {"Discord.exe"}
