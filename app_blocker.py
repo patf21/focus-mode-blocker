@@ -1,4 +1,24 @@
+"""
+Study Mode – Focus Blocker (Windows)
+
+Key features:
+- UI + Worker architecture (worker does blocking & cleanup; UI controls it)
+- Optional timer (minutes) in UI. Blank = run until stopped. Number = auto-stop.
+- Auto-elevate the WORKER via UAC if UI is not admin (so Git Bash/admin issues go away)
+- Firefox OPTIONAL:
+    - If Firefox is installed: uses Firefox enterprise policy (policies.json) + clears Firefox site data + restarts Firefox.
+    - If Firefox is NOT installed: runs HOSTS-ONLY mode (still blocks system-wide via hosts) + Discord kill loop.
+- Safe cleanup on stop / UI close / UI killed (worker watches parent PID)
+- Logs to app_blocker.log; UI tails this log so you still see activity even when worker is elevated (no stdout pipe).
+
+Run:
+- python app_blocker.py          (UI)
+- python app_blocker.py --worker --parent-pid <PID> [--duration-sec <seconds>]
+- python app_blocker.py --restore (manual cleanup if you ever hard-kill everything)
+"""
+
 import atexit
+import ctypes
 import json
 import os
 import shutil
@@ -15,9 +35,7 @@ import psutil
 import win32con
 import win32gui
 
-# ---------------------------
-# UI imports (only used in UI mode)
-# ---------------------------
+# UI
 import threading
 import queue
 import tkinter as tk
@@ -63,7 +81,6 @@ BLOCKED_DOMAINS = [
     "lnkd.in",
 ]
 
-
 HOSTS_BLOCK_ENTRIES = [
     # YouTube
     "youtube.com",
@@ -92,28 +109,13 @@ HOSTS_BLOCK_ENTRIES = [
     "lnkd.in",
 ]
 
-
 SITE_DATA_DOMAINS = [
-    # YouTube
-    "youtube.com",
-    "googlevideo.com",
-    "ytimg.com",
-
-    # Discord
-    "discord.com",
-    "discord.gg",
-
-    # Instagram
+    "youtube.com", "googlevideo.com", "ytimg.com",
+    "discord.com", "discord.gg",
     "instagram.com",
-
-    # Reddit
-    "reddit.com",
-    "redd.it",
-
-    # LinkedIn
+    "reddit.com", "redd.it",
     "linkedin.com",
 ]
-
 
 KILL_DISCORD_APP = True
 BLOCKED_PROCESSES = {"Discord.exe"}
@@ -124,7 +126,7 @@ AUTO_RESTART_FIREFOX = True
 FIREFOX_CLOSE_TIMEOUT_SEC = 15
 
 RESET_HOSTS_ON_EXIT = True
-RESET_HOSTS_ON_START = False
+RESET_HOSTS_ON_START = False  # WARNING: can wipe custom hosts entries.
 
 HOSTS_DEFAULT_CONTENT = r"""# Copyright (c) 1993-2009 Microsoft Corp.
 #
@@ -140,9 +142,39 @@ HOSTS_DEFAULT_CONTENT = r"""# Copyright (c) 1993-2009 Microsoft Corp.
 """
 
 FAIL_FAST_ON_CRITICAL_ERRORS = True
-
-# Worker will also periodically write a "heartbeat" so UI can show alive status
 HEARTBEAT_INTERVAL_SEC = 2.0
+
+
+# ============================================================
+# ADMIN / CONSOLE ENCODING HELPERS
+# ============================================================
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def relaunch_elevated(cmd: list[str]) -> bool:
+    """
+    Launch cmd with UAC prompt.
+    Returns True if ShellExecute appears successful.
+    """
+    try:
+        exe = cmd[0]
+        params = " ".join(f'"{a}"' if " " in a else a for a in cmd[1:])
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return rc > 32
+    except Exception:
+        return False
+
+def force_utf8_stdout_best_effort():
+    # Avoid UnicodeEncodeError on some Windows console streams.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -168,40 +200,32 @@ def log(msg: str) -> None:
         pass
 
 def print_exc(where: str) -> None:
-    txt = f"\n ERROR in {where}:\n{traceback.format_exc()}"
-    print(txt)
+    txt = f"\nERROR in {where}:\n{traceback.format_exc()}"
+    try:
+        print(txt)
+    except Exception:
+        pass
     log(txt)
 
 def print_warn(msg: str) -> None:
-    txt = f"\n Warning  {msg}"
-    print(txt)
+    txt = f"Warning: {msg}"
+    try:
+        print(txt)
+    except Exception:
+        pass
     log(txt)
 
 def print_info(msg: str) -> None:
-    print(msg)
+    try:
+        print(msg)
+    except Exception:
+        pass
     log(msg)
 
 
 # ============================================================
-# PATHS / FIREFOX DISCOVERY (FORCE DESKTOP EXE)
+# PATHS / SIGNALS
 # ============================================================
-
-def firefox_exe_path() -> Path:
-    candidates = [
-        Path(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
-        Path(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "Desktop Firefox not found in Program Files. "
-        "Install Firefox from mozilla.org (not the Microsoft Store)."
-    )
-
-def firefox_policies_path() -> Path:
-    fx = firefox_exe_path()
-    return fx.parent / "distribution" / "policies.json"
 
 def ensure_dir(p: Path) -> None:
     try:
@@ -210,9 +234,6 @@ def ensure_dir(p: Path) -> None:
         print_exc(f"ensure_dir({p})")
         if FAIL_FAST_ON_CRITICAL_ERRORS:
             raise
-
-def backup_path(policies_path: Path) -> Path:
-    return policies_path.with_name("policies.json.focus_backup")
 
 def hosts_path() -> Path:
     return Path(r"C:\Windows\System32\drivers\etc\hosts")
@@ -228,6 +249,31 @@ def heartbeat_path() -> Path:
 
 
 # ============================================================
+# FIREFOX (OPTIONAL)
+# ============================================================
+
+def firefox_exe_path(optional: bool = True) -> Path | None:
+    candidates = [
+        Path(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+        Path(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    if optional:
+        return None
+    raise FileNotFoundError(
+        "Desktop Firefox not found in Program Files. Install Firefox from mozilla.org (not the Microsoft Store)."
+    )
+
+def firefox_policies_path(fx: Path) -> Path:
+    return fx.parent / "distribution" / "policies.json"
+
+def backup_path(policies_path: Path) -> Path:
+    return policies_path.with_name("policies.json.focus_backup")
+
+
+# ============================================================
 # HOSTS (BACKUP + APPLY + RESET)
 # ============================================================
 
@@ -237,7 +283,7 @@ def backup_hosts() -> None:
         bp = hosts_backup_path()
         if not bp.exists():
             shutil.copy2(hp, bp)
-            print_info(f" Backed up hosts -> {bp}")
+            print_info(f"Backed up hosts -> {bp}")
     except Exception:
         print_exc("backup_hosts (non-fatal)")
 
@@ -245,7 +291,7 @@ def reset_hosts_to_default() -> None:
     try:
         hp = hosts_path()
         hp.write_text(HOSTS_DEFAULT_CONTENT, encoding="utf-8")
-        print_info(" Hosts file reset to default")
+        print_info("Hosts file reset to default")
     except Exception:
         print_exc("reset_hosts_to_default")
         if FAIL_FAST_ON_CRITICAL_ERRORS:
@@ -270,14 +316,14 @@ def apply_hosts_block() -> None:
             lines.extend(new_lines)
 
         hp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print_info(" Hosts blocking applied")
+        print_info("Hosts blocking applied")
     except Exception:
         print_exc("apply_hosts_block")
         raise
 
 
 # ============================================================
-# FIREFOX PROFILE / SITE DATA CLEAR
+# FIREFOX PROFILE / SITE DATA CLEAR (OPTIONAL)
 # ============================================================
 
 def firefox_default_profile_path() -> Path:
@@ -357,7 +403,7 @@ def clear_firefox_site_data(profile_path: Path, domains: list[str]) -> None:
 
 
 # ============================================================
-# POLICIES BACKUP / RESTORE / WRITE
+# POLICIES BACKUP / RESTORE / WRITE (OPTIONAL)
 # ============================================================
 
 def backup_existing(policies_path: Path) -> None:
@@ -367,10 +413,10 @@ def backup_existing(policies_path: Path) -> None:
 
         if policies_path.exists():
             shutil.copy2(policies_path, bkp)
-            print_info(f" Backed up policies.json -> {bkp}")
+            print_info(f"Backed up policies.json -> {bkp}")
         else:
             bkp.write_text(MARKER_NO_ORIGINAL, encoding="utf-8")
-            print_info(f" No original policies.json; wrote marker backup -> {bkp}")
+            print_info(f"No original policies.json; wrote marker backup -> {bkp}")
     except Exception:
         print_exc("backup_existing")
         if FAIL_FAST_ON_CRITICAL_ERRORS:
@@ -411,7 +457,7 @@ def write_policy(policies_path: Path) -> None:
         tmp.write_text(json.dumps(policy_obj, indent=2), encoding="utf-8")
         tmp.replace(policies_path)
 
-        print_info(f" Wrote Firefox policy: {policies_path}")
+        print_info(f"Wrote Firefox policy: {policies_path}")
     except Exception:
         print_exc("write_policy")
         if FAIL_FAST_ON_CRITICAL_ERRORS:
@@ -419,7 +465,7 @@ def write_policy(policies_path: Path) -> None:
 
 
 # ============================================================
-# FIREFOX PROCESS CONTROL
+# FIREFOX PROCESS CONTROL (OPTIONAL)
 # ============================================================
 
 def _enum_firefox_windows() -> list[int]:
@@ -494,8 +540,15 @@ def close_firefox_gracefully(timeout_sec: int = FIREFOX_CLOSE_TIMEOUT_SEC) -> No
         hard_kill_firefox()
         time.sleep(0.5)
 
-def launch_firefox() -> None:
-    fx = firefox_exe_path()
+def wait_for_firefox_exit(timeout=10) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if not is_firefox_running():
+            return True
+        time.sleep(0.2)
+    return False
+
+def launch_firefox(fx: Path) -> None:
     try:
         subprocess.Popen([str(fx)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print_info(f"Launching Firefox EXE: {fx}")
@@ -549,6 +602,7 @@ def kill_discord() -> None:
 
 _POLICIES_PATH: Path | None = None
 _CLEANED = False
+_FX_EXE: Path | None = None  # remember if we had Firefox
 
 def _close_and_clear_site_data_best_effort() -> None:
     try:
@@ -568,65 +622,59 @@ def _close_and_clear_site_data_best_effort() -> None:
     except Exception:
         print_exc("firefox_default_profile_path/clear_firefox_site_data (non-fatal)")
 
-def wait_for_firefox_exit(timeout=10):
-    end = time.time() + timeout
-    while time.time() < end:
-        if not is_firefox_running():
-            return True
-        time.sleep(0.2)
-    return False
-
 def cleanup_and_optionally_restart() -> None:
-    global _POLICIES_PATH, _CLEANED
+    global _POLICIES_PATH, _CLEANED, _FX_EXE
     if _CLEANED:
         return
     _CLEANED = True
 
-    # Close Firefox and clear site data
-    _close_and_clear_site_data_best_effort()
-    wait_for_firefox_exit()
+    # Firefox cleanup (only if Firefox exists/was used)
+    if _FX_EXE is not None:
+        _close_and_clear_site_data_best_effort()
+        wait_for_firefox_exit()
 
-    # Restore policies.json
-    if _POLICIES_PATH is not None:
-        try:
-            restored = restore_from_backup(_POLICIES_PATH)
-            if restored:
-                print_info("Restored Firefox policies.json to original state.")
-            else:
-                print_info("No backup found to restore (nothing to do).")
-        except Exception:
-            print_exc("cleanup.restore_from_backup (non-fatal)")
+        if _POLICIES_PATH is not None:
+            try:
+                restored = restore_from_backup(_POLICIES_PATH)
+                if restored:
+                    print_info("Restored Firefox policies.json to original state.")
+                else:
+                    print_info("No Firefox policy backup found to restore (nothing to do).")
+            except Exception:
+                print_exc("cleanup.restore_from_backup (non-fatal)")
 
     # Reset hosts
     if RESET_HOSTS_ON_EXIT:
         try:
             reset_hosts_to_default()
-            print_info("Reset hosts file to Windows default (cleared all custom blocks/entries).")
+            print_info("Reset hosts file to Windows default.")
         except Exception:
             print_exc("cleanup.reset_hosts_to_default (non-fatal)")
 
     # Restart Firefox unblocked
-    if AUTO_RESTART_FIREFOX:
+    if AUTO_RESTART_FIREFOX and _FX_EXE is not None:
         try:
             print_info("Restarting Firefox so the unblocked state takes effect...")
-            launch_firefox()
-            verify_firefox_binary(firefox_exe_path())
+            launch_firefox(_FX_EXE)
+            verify_firefox_binary(_FX_EXE)
         except Exception:
             print_exc("cleanup.launch_firefox (non-fatal)")
 
 def safe_recover_if_needed() -> None:
     """
-    If a previous run crashed/killed and left a backup marker behind, restore it.
-    This is best-effort and safe to run at startup.
+    Best-effort recovery if previous run was interrupted.
+    - If Firefox exists, restore policy backup if present.
+    - Optionally reset hosts at startup (disabled by default).
     """
-    try:
-        pp = firefox_policies_path()
-        if restore_from_backup(pp):
-            print_info("Startup recovery: restored original Firefox policies from backup.")
-    except Exception:
-        print_exc("safe_recover_if_needed (non-fatal)")
+    fx = firefox_exe_path(optional=True)
+    if fx is not None:
+        try:
+            pp = firefox_policies_path(fx)
+            if restore_from_backup(pp):
+                print_info("Startup recovery: restored original Firefox policies from backup.")
+        except Exception:
+            print_exc("safe_recover_if_needed (non-fatal)")
 
-    # Optional: reset hosts at startup (can be destructive)
     if RESET_HOSTS_ON_START:
         try:
             reset_hosts_to_default()
@@ -655,7 +703,9 @@ def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
       - optional duration timer expiring (auto-stop)
     On any event, runs cleanup and exits.
     """
-    global _POLICIES_PATH, _CLEANED
+    force_utf8_stdout_best_effort()
+
+    global _POLICIES_PATH, _CLEANED, _FX_EXE
     _CLEANED = False
 
     end_time: float | None = None
@@ -678,32 +728,42 @@ def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
         except Exception:
             pass
 
-        fx = firefox_exe_path()
-        policies_path = firefox_policies_path()
-        _POLICIES_PATH = policies_path
+        # Determine Firefox availability (optional)
+        fx = firefox_exe_path(optional=True)
+        _FX_EXE = fx
 
-        # If prior run crashed, recover first
-        if restore_from_backup(policies_path):
-            print_info("Recovered from previous interrupted run (restored original policies).")
+        if fx is None:
+            print_warn("Firefox not found. Running in HOSTS-ONLY mode (system-wide hosts blocking still applies).")
+        else:
+            print_info(f"Firefox detected: {fx}")
 
+        # Apply hosts blocks (system-wide)
         backup_hosts()
         apply_hosts_block()
 
+        # If enabled, this wipes hosts (generally leave disabled)
         if RESET_HOSTS_ON_START:
             reset_hosts_to_default()
             print_info("Reset hosts file to default at startup (enabled).")
 
-        # Ensure Firefox is closed before enabling policy
-        _close_and_clear_site_data_best_effort()
+        # Firefox policies (only if Firefox exists)
+        if fx is not None:
+            policies_path = firefox_policies_path(fx)
+            _POLICIES_PATH = policies_path
 
-        backup_existing(policies_path)
-        write_policy(policies_path)
+            # If prior run crashed, recover first
+            if restore_from_backup(policies_path):
+                print_info("Recovered from previous interrupted run (restored original policies).")
+
+            # Ensure Firefox is closed before enabling policy
+            _close_and_clear_site_data_best_effort()
+
+            backup_existing(policies_path)
+            write_policy(policies_path)
 
         # Ensure cleanup on normal exit signals (won't run on hard-kill)
         atexit.register(cleanup_and_optionally_restart)
 
-        print_info(f"Using Firefox EXE: {fx}")
-        print_info(f"Using Firefox policy file: {policies_path}")
         print_info("FOCUS MODE ON (worker active)")
         print_info("Worker will stop if UI requests stop, UI process is killed, or timer expires.")
 
@@ -711,8 +771,8 @@ def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
             mins = max(1, int(round(duration_sec / 60)))
             print_info(f"Timer enabled: auto-stop after ~{mins} minute(s).")
 
-        if AUTO_RESTART_FIREFOX:
-            launch_firefox()
+        if AUTO_RESTART_FIREFOX and fx is not None:
+            launch_firefox(fx)
             verify_firefox_binary(fx)
 
         last_hb = 0.0
@@ -754,7 +814,7 @@ def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
             time.sleep(1)
 
     except Exception:
-        print("\n🔥 WORKER FATAL ERROR — ABORTING 🔥")
+        print("\nWORKER FATAL ERROR — ABORTING")
         traceback.print_exc()
         log("WORKER FATAL:\n" + traceback.format_exc())
     finally:
@@ -762,6 +822,7 @@ def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
             cleanup_and_optionally_restart()
         except Exception:
             pass
+
         # best-effort cleanup artifacts
         try:
             if stop_signal_path().exists():
@@ -785,18 +846,27 @@ def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
 class FocusUI(tk.Tk):
     def __init__(self):
         super().__init__()
+        force_utf8_stdout_best_effort()
+
         self.title("Study Mode – Focus Blocker")
-        self.geometry("650x520")
-        self.minsize(650, 520)
+        self.geometry("700x560")
+        self.minsize(700, 560)
 
         self.log_q = queue.Queue()
         self._worker_proc: subprocess.Popen | None = None
         self._start_time: float | None = None
-        self._end_time: float | None = None  # if timer is enabled
+        self._end_time: float | None = None
+
+        self._tail_stop = threading.Event()
+        self._tail_offset = 0
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_ui()
+
+        # Tail log file so UI shows activity even when worker is elevated (no stdout pipe).
+        threading.Thread(target=self._tail_log_file, daemon=True).start()
+
         self._poll_worker_output()
         self._refresh_status()
 
@@ -821,20 +891,16 @@ class FocusUI(tk.Tk):
         self.stop_btn = ttk.Button(controls, text="Stop Focus Mode", command=self.stop_focus)
         self.stop_btn.pack(side="left", padx=(10, 0))
 
-        # Timer (minutes) - optional
         timer_frame = ttk.Frame(self)
         timer_frame.pack(fill="x", **pad)
 
         ttk.Label(timer_frame, text="Timer (minutes, optional):").pack(side="left")
         self.timer_entry = ttk.Entry(timer_frame, width=10)
         self.timer_entry.pack(side="left", padx=(8, 0))
-        ttk.Label(
-            timer_frame,
-            text="Leave blank to run until you stop it.",
-            foreground="gray"
-        ).pack(side="left", padx=(10, 0))
+        ttk.Label(timer_frame, text="Leave blank to run until you stop it.", foreground="gray").pack(
+            side="left", padx=(10, 0)
+        )
 
-        # Stop phrase box
         phrase_frame = ttk.Frame(self)
         phrase_frame.pack(fill="x", **pad)
 
@@ -845,13 +911,15 @@ class FocusUI(tk.Tk):
         log_frame = ttk.LabelFrame(self, text="Activity Log")
         log_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.log_text = tk.Text(log_frame, height=12, wrap="word")
+        self.log_text = tk.Text(log_frame, height=14, wrap="word")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.log_text.configure(state="disabled")
 
-        ttk.Label(self, text="Tip: Run this as Administrator for hosts/policies to work.", foreground="gray").pack(
-            anchor="w", padx=12, pady=(0, 10)
-        )
+        ttk.Label(
+            self,
+            text="Tip: Worker needs Administrator to modify hosts and Firefox policies. If needed, it will prompt UAC.",
+            foreground="gray"
+        ).pack(anchor="w", padx=12, pady=(0, 10))
 
     def _append_log(self, msg: str):
         self.log_text.configure(state="normal")
@@ -864,11 +932,16 @@ class FocusUI(tk.Tk):
 
     def _refresh_status(self):
         running = self._worker_running()
-        self.status_var.set("Status: ON (Focus Mode Active)" if running else "Status: OFF")
-        self.start_btn.configure(state=("disabled" if running else "normal"))
-        self.stop_btn.configure(state=("normal" if running else "disabled"))
+        # If we launched elevated via UAC, we won't have a Popen handle;
+        # In that case, infer running from heartbeat file presence.
+        hb_exists = heartbeat_path().exists()
+        inferred_running = running or hb_exists
 
-        if running and self._start_time is not None:
+        self.status_var.set("Status: ON (Focus Mode Active)" if inferred_running else "Status: OFF")
+        self.start_btn.configure(state=("disabled" if inferred_running else "normal"))
+        self.stop_btn.configure(state=("normal" if inferred_running else "disabled"))
+
+        if inferred_running and self._start_time is not None:
             if self._end_time is not None:
                 remaining = int(self._end_time - time.time())
                 if remaining < 0:
@@ -885,27 +958,60 @@ class FocusUI(tk.Tk):
         self.after(500, self._refresh_status)
 
     def _poll_worker_output(self):
-        # Drain queued output from worker thread
+        # Drain queued output from worker stdout thread (only when non-elevated Popen is used)
         try:
             while True:
                 msg = self.log_q.get_nowait()
                 self._append_log(msg)
         except queue.Empty:
             pass
-
         self.after(200, self._poll_worker_output)
+
+    def _tail_log_file(self):
+        """
+        Tail app_blocker.log and stream to UI.
+        Works even when worker is elevated (no stdout pipe).
+        """
+        p = _default_log_path()
+        # Start tail at end to avoid dumping huge history
+        try:
+            if p.exists():
+                self._tail_offset = p.stat().st_size
+        except Exception:
+            self._tail_offset = 0
+
+        while not self._tail_stop.is_set():
+            try:
+                if p.exists():
+                    size = p.stat().st_size
+                    if size < self._tail_offset:
+                        # log rotated/truncated
+                        self._tail_offset = 0
+                    if size > self._tail_offset:
+                        with p.open("r", encoding="utf-8", errors="ignore") as f:
+                            f.seek(self._tail_offset)
+                            chunk = f.read()
+                            self._tail_offset = f.tell()
+
+                        # Push new lines into the UI thread via queue
+                        for line in chunk.splitlines():
+                            if line.strip():
+                                self.log_q.put(line)
+            except Exception:
+                pass
+
+            time.sleep(0.25)
 
     def _parse_timer_minutes(self) -> int | None:
         """
         Returns:
-          None  -> no timer (run indefinitely)
-          int   -> duration in seconds
+          None -> no timer (run indefinitely)
+          int  -> duration in seconds
         """
         raw = (self.timer_entry.get() or "").strip()
         if not raw:
             return None
 
-        # Accept integers like "25", and also allow "25.0" / "0.5" etc.
         try:
             minutes = float(raw)
         except ValueError:
@@ -916,14 +1022,24 @@ class FocusUI(tk.Tk):
             messagebox.showwarning("Invalid timer", "Timer must be > 0 minutes, or leave blank.")
             return None
 
-        # Convert to seconds (round to nearest whole second)
         return int(round(minutes * 60))
 
+    def _build_worker_cmd(self, duration_sec: int | None) -> list[str]:
+        base_args = ["--worker", "--parent-pid", str(os.getpid())]
+        if duration_sec:
+            base_args += ["--duration-sec", str(duration_sec)]
+
+        if getattr(sys, "frozen", False):
+            return [sys.executable] + base_args
+        else:
+            return [sys.executable, str(Path(__file__).resolve())] + base_args
+
     def start_focus(self):
-        if self._worker_running():
+        # avoid double-start
+        if self._worker_running() or heartbeat_path().exists():
             return
 
-        # Best-effort: clear stop signal
+        # Clear stop signal
         try:
             sp = stop_signal_path()
             if sp.exists():
@@ -933,26 +1049,30 @@ class FocusUI(tk.Tk):
 
         duration_sec = self._parse_timer_minutes()
         if (self.timer_entry.get() or "").strip() and duration_sec is None:
-            # User typed something but parsing failed (we already warned).
             return
+
+        worker_cmd = self._build_worker_cmd(duration_sec)
 
         self._append_log("Starting focus mode worker..." + (" (timer enabled)" if duration_sec else ""))
 
-        # Launch worker subprocess
-        # We pass the UI's PID so worker can detect Task Manager kill of the UI.
-        base_args = ["--worker", "--parent-pid", str(os.getpid())]
-        if duration_sec:
-            base_args += ["--duration-sec", str(duration_sec)]
+        # Worker needs admin to edit hosts (and Firefox policies if present)
+        if not is_admin():
+            ok = relaunch_elevated(worker_cmd)
+            if ok:
+                self._append_log("Worker launched as Administrator (UAC).")
+                self._start_time = time.time()
+                self._end_time = (self._start_time + duration_sec) if duration_sec else None
+                # No Popen handle in elevated path; log tail will show activity.
+                self._worker_proc = None
+                return
+            else:
+                self._append_log("Failed to elevate worker. Try running this app as Administrator.")
+                return
 
-        # If frozen .exe, __file__ may not exist; use sys.executable only
-        if getattr(sys, "frozen", False):
-            args = [sys.executable] + base_args
-        else:
-            args = [sys.executable, str(Path(__file__).resolve())] + base_args
-
+        # Already admin: launch and capture stdout
         try:
             self._worker_proc = subprocess.Popen(
-                args,
+                worker_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -973,16 +1093,16 @@ class FocusUI(tk.Tk):
             if not self._worker_proc or not self._worker_proc.stdout:
                 return
             for line in self._worker_proc.stdout:
-                self.log_q.put(line.rstrip())
+                if line.strip():
+                    self.log_q.put(line.rstrip())
         except Exception as e:
             self.log_q.put(f"(UI) Worker output read error: {e}")
 
     def _stop_phrase_ok(self) -> bool:
-        typed = self.phrase_entry.get().strip()
-        return typed == STOP_PHRASE
+        return self.phrase_entry.get().strip() == STOP_PHRASE
 
     def stop_focus(self):
-        if not self._worker_running():
+        if not (self._worker_running() or heartbeat_path().exists()):
             return
 
         if REQUIRE_STOP_PHRASE and not self._stop_phrase_ok():
@@ -992,28 +1112,22 @@ class FocusUI(tk.Tk):
         if not messagebox.askyesno("Stop Focus Mode", "Turn OFF Focus Mode and restore normal browsing?"):
             return
 
-        # Signal the worker to stop
         try:
             stop_signal_path().write_text("stop", encoding="utf-8")
         except Exception as e:
             self._append_log(f"Failed to write stop signal: {e}")
 
-        # UI is not responsible for cleanup — worker is.
         self._append_log("Stop requested. Waiting for worker to exit...")
         self.phrase_entry.delete(0, "end")
 
     def on_close(self):
-        """
-        Closing UI should stop Focus Mode and undo blocks.
-        """
-        if self._worker_running():
+        if self._worker_running() or heartbeat_path().exists():
             if not messagebox.askyesno(
                 "Stop Focus Mode?",
                 "Focus Mode is ON.\n\nClosing will STOP focus mode and restore browsing.\n\nStop and close?"
             ):
                 return
 
-            # Request worker stop (worker will run cleanup)
             try:
                 stop_signal_path().write_text("stop", encoding="utf-8")
             except Exception as e:
@@ -1021,15 +1135,15 @@ class FocusUI(tk.Tk):
 
             self._append_log("Close requested. Waiting for worker cleanup...")
 
-            # Wait for worker to exit (so policies/hosts are restored)
-            deadline = time.time() + 20  # seconds
-            while self._worker_running() and time.time() < deadline:
+            deadline = time.time() + 20
+            while heartbeat_path().exists() and time.time() < deadline:
                 self.update()
                 time.sleep(0.2)
 
-            if self._worker_running():
+            if heartbeat_path().exists():
                 self._append_log("Worker still running; closing UI anyway (worker should still cleanup shortly).")
 
+        self._tail_stop.set()
         self.destroy()
 
 
@@ -1063,14 +1177,19 @@ def parse_args(argv: list[str]) -> dict:
 def restore_only() -> int:
     """
     Manual restore mode:
-      python script.py --restore
+      python app_blocker.py --restore
     Useful if you ever hard-kill BOTH processes and need cleanup.
     """
+    force_utf8_stdout_best_effort()
     try:
-        pp = firefox_policies_path()
-        global _POLICIES_PATH, _CLEANED
-        _POLICIES_PATH = pp
+        fx = firefox_exe_path(optional=True)
+        global _POLICIES_PATH, _CLEANED, _FX_EXE
         _CLEANED = False
+        _FX_EXE = fx
+        if fx is not None:
+            _POLICIES_PATH = firefox_policies_path(fx)
+        else:
+            _POLICIES_PATH = None
         cleanup_and_optionally_restart()
         print_info("Restore complete.")
         return 0
@@ -1094,7 +1213,7 @@ def main():
         app = FocusUI()
         app.mainloop()
     except Exception:
-        print("\n UI FATAL ERROR — PROGRAM ABORTED ")
+        print("\nUI FATAL ERROR — PROGRAM ABORTED")
         traceback.print_exc()
         log("UI FATAL:\n" + traceback.format_exc())
         if getattr(sys, "frozen", False):
