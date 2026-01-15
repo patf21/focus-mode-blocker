@@ -568,6 +568,14 @@ def _close_and_clear_site_data_best_effort() -> None:
     except Exception:
         print_exc("firefox_default_profile_path/clear_firefox_site_data (non-fatal)")
 
+def wait_for_firefox_exit(timeout=10):
+    end = time.time() + timeout
+    while time.time() < end:
+        if not is_firefox_running():
+            return True
+        time.sleep(0.2)
+    return False
+
 def cleanup_and_optionally_restart() -> None:
     global _POLICIES_PATH, _CLEANED
     if _CLEANED:
@@ -577,6 +585,7 @@ def cleanup_and_optionally_restart() -> None:
     # Close Firefox and clear site data
     _close_and_clear_site_data_best_effort()
     wait_for_firefox_exit()
+
     # Restore policies.json
     if _POLICIES_PATH is not None:
         try:
@@ -617,8 +626,7 @@ def safe_recover_if_needed() -> None:
     except Exception:
         print_exc("safe_recover_if_needed (non-fatal)")
 
-    # If you want: optionally reset hosts at startup when you suspect prior hard-kill.
-    # This is potentially destructive to custom entries, so we only do it if enabled.
+    # Optional: reset hosts at startup (can be destructive)
     if RESET_HOSTS_ON_START:
         try:
             reset_hosts_to_default()
@@ -628,7 +636,7 @@ def safe_recover_if_needed() -> None:
 
 
 # ============================================================
-# WORKER PROCESS (does blocking + watchdog)
+# WORKER PROCESS (does blocking + watchdog + optional timer)
 # ============================================================
 
 def _pid_alive(pid: int) -> bool:
@@ -639,15 +647,20 @@ def _pid_alive(pid: int) -> bool:
     except Exception:
         return False
 
-def worker_main(parent_pid: int | None) -> int:
+def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
     """
     Runs focus mode and watches for:
       - stop signal file
       - parent PID dying (Task Manager kill of UI)
-    On either event, runs cleanup and exits.
+      - optional duration timer expiring (auto-stop)
+    On any event, runs cleanup and exits.
     """
     global _POLICIES_PATH, _CLEANED
     _CLEANED = False
+
+    end_time: float | None = None
+    if duration_sec is not None and duration_sec > 0:
+        end_time = time.time() + float(duration_sec)
 
     try:
         if os.name != "nt":
@@ -692,7 +705,11 @@ def worker_main(parent_pid: int | None) -> int:
         print_info(f"Using Firefox EXE: {fx}")
         print_info(f"Using Firefox policy file: {policies_path}")
         print_info("FOCUS MODE ON (worker active)")
-        print_info("Worker will stop if UI requests stop, or if UI process is killed.")
+        print_info("Worker will stop if UI requests stop, UI process is killed, or timer expires.")
+
+        if end_time is not None:
+            mins = max(1, int(round(duration_sec / 60)))
+            print_info(f"Timer enabled: auto-stop after ~{mins} minute(s).")
 
         if AUTO_RESTART_FIREFOX:
             launch_firefox()
@@ -713,6 +730,11 @@ def worker_main(parent_pid: int | None) -> int:
                     break
             except Exception:
                 pass
+
+            # Timer expired?
+            if end_time is not None and time.time() >= end_time:
+                print_info("Timer expired. Auto-stopping focus mode...")
+                break
 
             # Parent died? (e.g., UI killed in Task Manager)
             if parent_pid is not None and parent_pid > 0:
@@ -764,12 +786,13 @@ class FocusUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Study Mode – Focus Blocker")
-        self.geometry("650x450")
-        self.minsize(650, 450)
+        self.geometry("650x520")
+        self.minsize(650, 520)
 
         self.log_q = queue.Queue()
         self._worker_proc: subprocess.Popen | None = None
         self._start_time: float | None = None
+        self._end_time: float | None = None  # if timer is enabled
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -797,6 +820,19 @@ class FocusUI(tk.Tk):
 
         self.stop_btn = ttk.Button(controls, text="Stop Focus Mode", command=self.stop_focus)
         self.stop_btn.pack(side="left", padx=(10, 0))
+
+        # Timer (minutes) - optional
+        timer_frame = ttk.Frame(self)
+        timer_frame.pack(fill="x", **pad)
+
+        ttk.Label(timer_frame, text="Timer (minutes, optional):").pack(side="left")
+        self.timer_entry = ttk.Entry(timer_frame, width=10)
+        self.timer_entry.pack(side="left", padx=(8, 0))
+        ttk.Label(
+            timer_frame,
+            text="Leave blank to run until you stop it.",
+            foreground="gray"
+        ).pack(side="left", padx=(10, 0))
 
         # Stop phrase box
         phrase_frame = ttk.Frame(self)
@@ -833,10 +869,18 @@ class FocusUI(tk.Tk):
         self.stop_btn.configure(state=("normal" if running else "disabled"))
 
         if running and self._start_time is not None:
-            elapsed = int(time.time() - self._start_time)
-            self.timer_var.set(f"Running: {elapsed//60:02d}:{elapsed%60:02d}")
+            if self._end_time is not None:
+                remaining = int(self._end_time - time.time())
+                if remaining < 0:
+                    remaining = 0
+                self.timer_var.set(f"Remaining: {remaining//60:02d}:{remaining%60:02d}")
+            else:
+                elapsed = int(time.time() - self._start_time)
+                self.timer_var.set(f"Running: {elapsed//60:02d}:{elapsed%60:02d}")
         else:
             self.timer_var.set("")
+            self._start_time = None
+            self._end_time = None
 
         self.after(500, self._refresh_status)
 
@@ -851,6 +895,30 @@ class FocusUI(tk.Tk):
 
         self.after(200, self._poll_worker_output)
 
+    def _parse_timer_minutes(self) -> int | None:
+        """
+        Returns:
+          None  -> no timer (run indefinitely)
+          int   -> duration in seconds
+        """
+        raw = (self.timer_entry.get() or "").strip()
+        if not raw:
+            return None
+
+        # Accept integers like "25", and also allow "25.0" / "0.5" etc.
+        try:
+            minutes = float(raw)
+        except ValueError:
+            messagebox.showwarning("Invalid timer", "Timer must be a number of minutes (e.g., 25). Or leave blank.")
+            return None
+
+        if minutes <= 0:
+            messagebox.showwarning("Invalid timer", "Timer must be > 0 minutes, or leave blank.")
+            return None
+
+        # Convert to seconds (round to nearest whole second)
+        return int(round(minutes * 60))
+
     def start_focus(self):
         if self._worker_running():
             return
@@ -863,15 +931,24 @@ class FocusUI(tk.Tk):
         except Exception:
             pass
 
-        self._append_log("Starting focus mode worker...")
+        duration_sec = self._parse_timer_minutes()
+        if (self.timer_entry.get() or "").strip() and duration_sec is None:
+            # User typed something but parsing failed (we already warned).
+            return
+
+        self._append_log("Starting focus mode worker..." + (" (timer enabled)" if duration_sec else ""))
 
         # Launch worker subprocess
         # We pass the UI's PID so worker can detect Task Manager kill of the UI.
-        args = [sys.executable if not getattr(sys, "frozen", False) else sys.executable, str(Path(__file__).resolve()), "--worker", "--parent-pid", str(os.getpid())]
+        base_args = ["--worker", "--parent-pid", str(os.getpid())]
+        if duration_sec:
+            base_args += ["--duration-sec", str(duration_sec)]
 
-        # If frozen .exe, __file__ may not exist; in that case use sys.executable and args accordingly.
+        # If frozen .exe, __file__ may not exist; use sys.executable only
         if getattr(sys, "frozen", False):
-            args = [sys.executable, "--worker", "--parent-pid", str(os.getpid())]
+            args = [sys.executable] + base_args
+        else:
+            args = [sys.executable, str(Path(__file__).resolve())] + base_args
 
         try:
             self._worker_proc = subprocess.Popen(
@@ -883,11 +960,13 @@ class FocusUI(tk.Tk):
                 universal_newlines=True
             )
             self._start_time = time.time()
+            self._end_time = (self._start_time + duration_sec) if duration_sec else None
             threading.Thread(target=self._read_worker_stdout, daemon=True).start()
         except Exception as e:
             self._append_log(f"Failed to start worker: {e}")
             self._worker_proc = None
             self._start_time = None
+            self._end_time = None
 
     def _read_worker_stdout(self):
         try:
@@ -928,7 +1007,6 @@ class FocusUI(tk.Tk):
         Closing UI should stop Focus Mode and undo blocks.
         """
         if self._worker_running():
-            # Optional: keep your warning, but now we actually stop on close
             if not messagebox.askyesno(
                 "Stop Focus Mode?",
                 "Focus Mode is ON.\n\nClosing will STOP focus mode and restore browsing.\n\nStop and close?"
@@ -954,29 +1032,32 @@ class FocusUI(tk.Tk):
 
         self.destroy()
 
-def wait_for_firefox_exit(timeout=10):
-        end = time.time() + timeout
-        while time.time() < end:
-            if not is_firefox_running():
-                return True
-            time.sleep(0.2)
-        return False
+
 # ============================================================
 # ENTRYPOINT + ARG PARSING
 # ============================================================
 
 def parse_args(argv: list[str]) -> dict:
-    out = {"mode": "ui", "parent_pid": None}
+    out = {"mode": "ui", "parent_pid": None, "duration_sec": None}
     if "--worker" in argv:
         out["mode"] = "worker"
     if "--restore" in argv:
         out["mode"] = "restore"
+
     if "--parent-pid" in argv:
         try:
             i = argv.index("--parent-pid")
             out["parent_pid"] = int(argv[i + 1])
         except Exception:
             out["parent_pid"] = None
+
+    if "--duration-sec" in argv:
+        try:
+            i = argv.index("--duration-sec")
+            out["duration_sec"] = int(float(argv[i + 1]))
+        except Exception:
+            out["duration_sec"] = None
+
     return out
 
 def restore_only() -> int:
@@ -1005,7 +1086,8 @@ def main():
 
     if args["mode"] == "worker":
         parent_pid = args.get("parent_pid")
-        sys.exit(worker_main(parent_pid))
+        duration_sec = args.get("duration_sec")
+        sys.exit(worker_main(parent_pid, duration_sec))
 
     # UI mode
     try:
