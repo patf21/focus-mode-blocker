@@ -1,85 +1,63 @@
 """
-Study Mode – Focus Blocker (Windows)
+Study Mode – Focus Blocker (Windows) [HOSTS-ONLY + crash failsafe, AV-friendly]
 
-Key features:
-- UI + Worker architecture (worker does blocking & cleanup; UI controls it)
-- Optional timer (minutes) in UI. Blank = run until stopped. Number = auto-stop.
-- Auto-elevate the WORKER via UAC if UI is not admin (so Git Bash/admin issues go away)
-- Firefox OPTIONAL:
-    - If Firefox is installed: uses Firefox enterprise policy (policies.json) + clears Firefox site data + restarts Firefox.
-    - If Firefox is NOT installed: runs HOSTS-ONLY mode (still blocks system-wide via hosts) + Discord kill loop.
-- Safe cleanup on stop / UI close / UI killed (worker watches parent PID)
-- Logs to app_blocker.log; UI tails this log so you still see activity even when worker is elevated (no stdout pipe).
-
-Run:
-- python app_blocker.py          (UI)
-- python app_blocker.py --worker --parent-pid <PID> [--duration-sec <seconds>]
-- python app_blocker.py --restore (manual cleanup if you ever hard-kill everything)
+Key points:
+- NO auto-UAC elevation (run UI as Admin when you want to start focus mode).
+- HOSTS-only blocking; no Program Files writes; no browser policy writes.
+- Exactly TWO processes during focus mode:
+    1) UI process
+    2) ONE combined Worker+Watcher process (does blocking + watches UI PID; cleans up if UI dies)
+  -> "dont open a separate worker if theres a watcher" satisfied (watcher is inside worker).
+- Crash failsafe:
+    - Startup recovery: if last run didn't exit cleanly, auto-unblock.
+    - Aggressive unblock: removes marked block section + any hosts entries for target domains.
+    - Flush DNS cache on cleanup/recovery.
 """
 
 import atexit
 import ctypes
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-
-import psutil
-
-# pywin32
-import win32con
-import win32gui
-
-# UI
-import threading
-import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+import psutil
+import winsound
+
+def ding_start():
+    # higher pitch, shorter
+    try:
+        winsound.Beep(880, 180)
+        winsound.Beep(880, 180)
+    except Exception:
+        pass
+
+def ding_stop():
+    # lower pitch, longer
+    try:
+        winsound.Beep(440, 220)
+        winsound.Beep(330, 220)
+    except Exception:
+        pass
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
+APP_NAME = "StudyModeFocusBlocker"
+
 STOP_PHRASE = "The quick brown fox jumps over the lazy dog"
 REQUIRE_STOP_PHRASE = True
-
-BLOCKED_DOMAINS = [
-    # YouTube
-    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
-    "studio.youtube.com", "kids.youtube.com",
-    "accounts.youtube.com", "apis.google.com",
-    "*.youtube.com", "youtu.be", "*.youtu.be",
-
-    # Google redirect / consent / auth pages
-    "consent.google.com", "www.google.com", "accounts.google.com",
-
-    # Video delivery / assets
-    "googlevideo.com", "*.googlevideo.com",
-    "ytimg.com", "*.ytimg.com",
-    "youtubei.googleapis.com", "youtube.googleapis.com",
-
-    # Discord
-    "discord.com", "www.discord.com", "*.discord.com",
-    "discord.gg", "*.discord.gg",
-
-    # Instagram
-    "instagram.com", "www.instagram.com", "*.instagram.com",
-
-    # Reddit
-    "reddit.com", "www.reddit.com", "*.reddit.com",
-    "old.reddit.com", "new.reddit.com",
-    "redd.it", "*.redd.it",
-
-    # LinkedIn
-    "linkedin.com", "www.linkedin.com", "*.linkedin.com",
-    "lnkd.in",
-]
 
 HOSTS_BLOCK_ENTRIES = [
     # YouTube
@@ -89,6 +67,14 @@ HOSTS_BLOCK_ENTRIES = [
     "youtu.be",
     "googlevideo.com",
     "ytimg.com",
+    "i.ytimg.com",
+
+    # Discord (network block; no kill loop)
+    "discord.com",
+    "www.discord.com",
+    "discord.gg",
+    "cdn.discordapp.com",
+    "media.discordapp.net",
 
     # Instagram
     "instagram.com",
@@ -109,44 +95,22 @@ HOSTS_BLOCK_ENTRIES = [
     "lnkd.in",
 ]
 
-SITE_DATA_DOMAINS = [
-    "youtube.com", "googlevideo.com", "ytimg.com",
-    "discord.com", "discord.gg",
-    "instagram.com",
-    "reddit.com", "redd.it",
-    "linkedin.com",
-]
+CLOSE_DISCORD_ON_START = True
+DISCORD_PROCESS_NAMES = {"Discord.exe", "Update.exe"}
 
-KILL_DISCORD_APP = True
-BLOCKED_PROCESSES = {"Discord.exe"}
-
-MARKER_NO_ORIGINAL = "__NO_ORIGINAL_FILE__"
-
-AUTO_RESTART_FIREFOX = True
-FIREFOX_CLOSE_TIMEOUT_SEC = 15
-
-RESET_HOSTS_ON_EXIT = True
-RESET_HOSTS_ON_START = False  # WARNING: can wipe custom hosts entries.
-
-HOSTS_DEFAULT_CONTENT = r"""# Copyright (c) 1993-2009 Microsoft Corp.
-#
-# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.
-#
-# This file contains the mappings of IP addresses to host names. Each
-# entry should be kept on an individual line. The IP address and the host name
-# should be separated by at least one space.
-#
-# localhost name resolution is handled within DNS itself.
-#	127.0.0.1       localhost
-#	::1             localhost
-"""
-
-FAIL_FAST_ON_CRITICAL_ERRORS = True
 HEARTBEAT_INTERVAL_SEC = 2.0
+
+# Markers (support both correct + old typo)
+HOSTS_MARK_START = "# --- STUDYMODE_FOCUS_BLOCKER_START ---"
+HOSTS_MARK_START_OLD = "# --- STUDYDDYMODE_FOCUS_BLOCKER_START ---"  # old typo marker
+HOSTS_MARK_END = "# --- STUDYMODE_FOCUS_BLOCKER_END ---"
+
+# Session lock for crash recovery
+SESSION_LOCK_FILENAME = "focusmode.session.json"
 
 
 # ============================================================
-# ADMIN / CONSOLE ENCODING HELPERS
+# PATHS / LOGGING
 # ============================================================
 
 def is_admin() -> bool:
@@ -155,51 +119,50 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def relaunch_elevated(cmd: list[str]) -> bool:
-    """
-    Launch cmd with UAC prompt.
-    Returns True if ShellExecute appears successful.
-    """
-    try:
-        exe = cmd[0]
-        params = " ".join(f'"{a}"' if " " in a else a for a in cmd[1:])
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-        return rc > 32
-    except Exception:
-        return False
+def app_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
+    p = Path(base) / APP_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-def force_utf8_stdout_best_effort():
-    # Avoid UnicodeEncodeError on some Windows console streams.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+def log_path() -> Path:
+    return app_data_dir() / "app_blocker.log"
 
+def stop_signal_path() -> Path:
+    return app_data_dir() / "focusmode.stop"
 
-# ============================================================
-# LOGGING
-# ============================================================
+def heartbeat_path() -> Path:
+    return app_data_dir() / "focusmode.heartbeat"
 
-def app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+def hosts_backup_path() -> Path:
+    return app_data_dir() / "hosts.backup"
 
-def _default_log_path() -> Path:
-    return app_dir() / "app_blocker.log"
+def session_lock_path() -> Path:
+    return app_data_dir() / SESSION_LOCK_FILENAME
 
 def log(msg: str) -> None:
     try:
-        p = _default_log_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().isoformat(timespec="seconds")
-        with p.open("a", encoding="utf-8") as f:
+        with log_path().open("a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
 
-def print_exc(where: str) -> None:
+def info(msg: str) -> None:
+    try:
+        print(msg)
+    except Exception:
+        pass
+    log(msg)
+
+def warn(msg: str) -> None:
+    try:
+        print(f"Warning: {msg}")
+    except Exception:
+        pass
+    log(f"Warning: {msg}")
+
+def err(where: str) -> None:
     txt = f"\nERROR in {where}:\n{traceback.format_exc()}"
     try:
         print(txt)
@@ -207,656 +170,426 @@ def print_exc(where: str) -> None:
         pass
     log(txt)
 
-def print_warn(msg: str) -> None:
-    txt = f"Warning: {msg}"
-    try:
-        print(txt)
-    except Exception:
-        pass
-    log(txt)
 
-def print_info(msg: str) -> None:
+# ============================================================
+# SESSION LOCK / HEARTBEAT
+# ============================================================
+
+def write_session_lock(worker_pid: int, ui_pid: int | None) -> None:
     try:
-        print(msg)
+        data = {
+            "worker_pid": int(worker_pid),
+            "ui_pid": int(ui_pid) if ui_pid else 0,
+            "started_at": int(time.time()),
+        }
+        session_lock_path().write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
-    log(msg)
+
+def read_session_lock() -> dict | None:
+    try:
+        p = session_lock_path()
+        if not p.exists():
+            return None
+        return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+def clear_session_lock() -> None:
+    try:
+        p = session_lock_path()
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+def is_heartbeat_fresh(max_age_sec: float = 6.0) -> bool:
+    p = heartbeat_path()
+    try:
+        if not p.exists():
+            return False
+        txt = p.read_text(encoding="utf-8", errors="ignore").strip()
+        t = int(txt)
+        return (time.time() - t) <= max_age_sec
+    except Exception:
+        return False
+
+def write_heartbeat() -> None:
+    try:
+        heartbeat_path().write_text(str(int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ============================================================
-# PATHS / SIGNALS
+# HOSTS MANAGEMENT (aggressive unblock)
 # ============================================================
-
-def ensure_dir(p: Path) -> None:
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        print_exc(f"ensure_dir({p})")
-        if FAIL_FAST_ON_CRITICAL_ERRORS:
-            raise
 
 def hosts_path() -> Path:
     return Path(r"C:\Windows\System32\drivers\etc\hosts")
 
-def hosts_backup_path() -> Path:
-    return app_dir() / "hosts.focus_backup"
-
-def stop_signal_path() -> Path:
-    return app_dir() / "focusmode.stop"
-
-def heartbeat_path() -> Path:
-    return app_dir() / "focusmode.heartbeat"
-
-
-# ============================================================
-# FIREFOX (OPTIONAL)
-# ============================================================
-
-def firefox_exe_path(optional: bool = True) -> Path | None:
-    candidates = [
-        Path(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
-        Path(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    if optional:
-        return None
-    raise FileNotFoundError(
-        "Desktop Firefox not found in Program Files. Install Firefox from mozilla.org (not the Microsoft Store)."
-    )
-
-def firefox_policies_path(fx: Path) -> Path:
-    return fx.parent / "distribution" / "policies.json"
-
-def backup_path(policies_path: Path) -> Path:
-    return policies_path.with_name("policies.json.focus_backup")
-
-
-# ============================================================
-# HOSTS (BACKUP + APPLY + RESET)
-# ============================================================
-
-def backup_hosts() -> None:
+def backup_hosts_once() -> None:
     try:
         hp = hosts_path()
         bp = hosts_backup_path()
         if not bp.exists():
             shutil.copy2(hp, bp)
-            print_info(f"Backed up hosts -> {bp}")
+            info(f"Backed up hosts -> {bp}")
     except Exception:
-        print_exc("backup_hosts (non-fatal)")
+        err("backup_hosts_once")
 
-def reset_hosts_to_default() -> None:
+def _normalize_host(h: str) -> str:
+    h = (h or "").strip().lower().rstrip(".")
+    return h
+
+def _target_domains_set() -> set[str]:
+    s = set()
+    for d in HOSTS_BLOCK_ENTRIES:
+        d = _normalize_host(d)
+        if d:
+            s.add(d)
+    return s
+
+def _host_matches_target(host: str, targets: set[str]) -> bool:
+    host = _normalize_host(host)
+    if not host:
+        return False
+    if host in targets:
+        return True
+    # If targets contains "youtube.com", remove "m.youtube.com", "www.youtube.com", etc.
+    for t in targets:
+        if host == t:
+            return True
+        if host.endswith("." + t):
+            return True
+    return False
+
+def remove_marked_block_section(lines: list[str]) -> list[str]:
+    start_markers = {HOSTS_MARK_START, HOSTS_MARK_START_OLD}
+    end_markers = {HOSTS_MARK_END}
+
+    out: list[str] = []
+    in_block = False
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped in start_markers:
+            in_block = True
+            continue
+        if stripped in end_markers:
+            in_block = False
+            continue
+        if not in_block:
+            out.append(raw)
+    return out
+
+def remove_all_focus_blocks() -> None:
+    """
+    Aggressive unblock:
+    - Remove marked section (supports old typo marker)
+    - Remove any 127.0.0.1 / 0.0.0.0 / ::1 mappings for target domains,
+      even if markers are missing/corrupted.
+    """
     try:
         hp = hosts_path()
-        hp.write_text(HOSTS_DEFAULT_CONTENT, encoding="utf-8")
-        print_info("Hosts file reset to default")
+        if not hp.exists():
+            return
+
+        text = hp.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+
+        # 1) remove our marked block section
+        lines = remove_marked_block_section(lines)
+
+        # 2) remove stray blocking entries for our targets
+        targets = _target_domains_set()
+        cleaned: list[str] = []
+
+        for raw in lines:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+
+            if not stripped or stripped.startswith("#"):
+                cleaned.append(line)
+                continue
+
+            parts = stripped.split()
+            if len(parts) < 2:
+                cleaned.append(line)
+                continue
+
+            ip = parts[0].strip()
+            host = parts[1].strip()
+
+            if ip in ("127.0.0.1", "0.0.0.0", "::1") and _host_matches_target(host, targets):
+                # drop it
+                continue
+
+            cleaned.append(line)
+
+        hp.write_text("\n".join(cleaned).rstrip() + "\n", encoding="utf-8")
+        info("Removed all focus blocker hosts entries (aggressive).")
     except Exception:
-        print_exc("reset_hosts_to_default")
-        if FAIL_FAST_ON_CRITICAL_ERRORS:
-            raise
+        err("remove_all_focus_blocks")
+
+def inject_hosts_block(text: str) -> str:
+    # Remove any existing marked section first, then append a fresh section
+    lines = text.splitlines()
+    lines = remove_marked_block_section(lines)
+    cleaned = "\n".join(lines).rstrip("\n")
+
+    block_lines = [
+        "",
+        HOSTS_MARK_START,
+        "# This section was added by Study Mode Focus Blocker.",
+        "# It will be removed automatically when you stop focus mode.",
+    ]
+    for d in HOSTS_BLOCK_ENTRIES:
+        d = d.strip()
+        if not d or d.startswith("#"):
+            continue
+        block_lines.append(f"127.0.0.1 {d}")
+    block_lines.append(HOSTS_MARK_END)
+
+    return cleaned + "\n" + "\n".join(block_lines) + "\n"
 
 def apply_hosts_block() -> None:
     try:
         hp = hosts_path()
-        text = hp.read_text(encoding="utf-8", errors="ignore")
-        lines = text.splitlines()
-        existing = set(l.strip() for l in lines)
-
-        new_lines = []
-        for d in HOSTS_BLOCK_ENTRIES:
-            entry = f"127.0.0.1 {d}"
-            if entry not in existing:
-                new_lines.append(entry)
-
-        if new_lines:
-            lines.append("")
-            lines.append("# --- app_blocker focus mode ---")
-            lines.extend(new_lines)
-
-        hp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print_info("Hosts blocking applied")
+        original = hp.read_text(encoding="utf-8", errors="ignore")
+        hp.write_text(inject_hosts_block(original), encoding="utf-8")
+        info("Hosts blocking section applied.")
+        ding_start()
     except Exception:
-        print_exc("apply_hosts_block")
+        err("apply_hosts_block")
         raise
 
-
-# ============================================================
-# FIREFOX PROFILE / SITE DATA CLEAR (OPTIONAL)
-# ============================================================
-
-def firefox_default_profile_path() -> Path:
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        raise RuntimeError("APPDATA env var not found; cannot locate Firefox profile.")
-
-    profiles_ini = Path(appdata) / "Mozilla" / "Firefox" / "profiles.ini"
-    if not profiles_ini.exists():
-        raise RuntimeError(f"profiles.ini not found at: {profiles_ini}")
-
-    text = profiles_ini.read_text(encoding="utf-8", errors="ignore")
-
-    current: dict[str, str] = {}
-    in_profile = False
-    chosen_path: str | None = None
-    chosen_is_relative = True
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-
-        if line.startswith("[Profile"):
-            current = {}
-            in_profile = True
-            continue
-
-        if not in_profile:
-            continue
-
-        if line.startswith("[") and line.endswith("]") and not line.startswith("[Profile"):
-            in_profile = False
-            continue
-
-        if "=" in line:
-            k, v = line.split("=", 1)
-            current[k.strip()] = v.strip()
-
-            if current.get("Default") == "1" and "Path" in current:
-                chosen_path = current["Path"]
-                chosen_is_relative = (current.get("IsRelative", "1") == "1")
-
-    if not chosen_path:
-        raise RuntimeError("Could not find Default=1 profile in profiles.ini.")
-
-    base = Path(appdata) / "Mozilla" / "Firefox"
-    return (base / chosen_path) if chosen_is_relative else Path(chosen_path)
-
-def clear_firefox_site_data(profile_path: Path, domains: list[str]) -> None:
+def restore_hosts_from_backup_best_effort() -> None:
+    """
+    Restore exact backup if present, then ALSO run aggressive removal just in case
+    backup was captured when blocked.
+    """
     try:
-        storage_default = profile_path / "storage" / "default"
-        if not storage_default.exists():
-            return
-
-        needles = []
-        for d in domains:
-            d = d.lower().strip()
-            if d:
-                needles.append(d.replace(".", "+"))
-
-        for entry in storage_default.iterdir():
-            name = entry.name.lower()
-            if any(n in name for n in needles):
-                try:
-                    if entry.is_dir():
-                        shutil.rmtree(entry, ignore_errors=True)
-                    else:
-                        try:
-                            entry.unlink()
-                        except FileNotFoundError:
-                            pass
-                except Exception:
-                    print_exc(f"clear_firefox_site_data removing {entry} (non-fatal)")
-    except Exception:
-        print_exc("clear_firefox_site_data (non-fatal)")
-
-
-# ============================================================
-# POLICIES BACKUP / RESTORE / WRITE (OPTIONAL)
-# ============================================================
-
-def backup_existing(policies_path: Path) -> None:
-    try:
-        bkp = backup_path(policies_path)
-        ensure_dir(policies_path)
-
-        if policies_path.exists():
-            shutil.copy2(policies_path, bkp)
-            print_info(f"Backed up policies.json -> {bkp}")
+        bp = hosts_backup_path()
+        if bp.exists():
+            shutil.copy2(bp, hosts_path())
+            info("Hosts restored from backup.")
         else:
-            bkp.write_text(MARKER_NO_ORIGINAL, encoding="utf-8")
-            print_info(f"No original policies.json; wrote marker backup -> {bkp}")
+            warn("No hosts backup found; skipping restore.")
     except Exception:
-        print_exc("backup_existing")
-        if FAIL_FAST_ON_CRITICAL_ERRORS:
-            raise
+        err("restore_hosts_from_backup_best_effort")
 
-def restore_from_backup(policies_path: Path) -> bool:
+    # Always do aggressive removal afterwards (guarantees unblock)
+    remove_all_focus_blocks()
+
+def flush_dns_cache_best_effort() -> None:
     try:
-        bkp = backup_path(policies_path)
-        if not bkp.exists():
-            return False
-
-        content = bkp.read_text(encoding="utf-8", errors="ignore").strip()
-        if content == MARKER_NO_ORIGINAL:
-            try:
-                if policies_path.exists():
-                    policies_path.unlink()
-            except Exception:
-                pass
-        else:
-            shutil.copy2(bkp, policies_path)
-
-        try:
-            bkp.unlink()
-        except Exception:
-            pass
-
-        return True
-    except Exception:
-        print_exc("restore_from_backup")
-        return False
-
-def write_policy(policies_path: Path) -> None:
-    try:
-        policy_obj = {"policies": {"WebsiteFilter": {"Block": BLOCKED_DOMAINS}}}
-        policies_path.parent.mkdir(parents=True, exist_ok=True)
-
-        tmp = policies_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(policy_obj, indent=2), encoding="utf-8")
-        tmp.replace(policies_path)
-
-        print_info(f"Wrote Firefox policy: {policies_path}")
-    except Exception:
-        print_exc("write_policy")
-        if FAIL_FAST_ON_CRITICAL_ERRORS:
-            raise
-
-
-# ============================================================
-# FIREFOX PROCESS CONTROL (OPTIONAL)
-# ============================================================
-
-def _enum_firefox_windows() -> list[int]:
-    result: list[int] = []
-
-    def cb(hwnd, _):
-        try:
-            if win32gui.IsWindowVisible(hwnd):
-                cls = win32gui.GetClassName(hwnd)
-                if cls == "MozillaWindowClass":
-                    result.append(hwnd)
-        except Exception:
-            pass
-        return True
-
-    try:
-        win32gui.EnumWindows(cb, None)
+        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True)
+        info("Flushed DNS cache.")
     except Exception:
         pass
 
-    return result
-
-def is_firefox_running() -> bool:
-    try:
-        for p in psutil.process_iter(["name"]):
-            try:
-                if (p.info["name"] or "").lower() == "firefox.exe":
-                    return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        return False
-    except Exception:
-        return False
-
-def hard_kill_firefox() -> None:
-    try:
-        for p in psutil.process_iter(["name"]):
-            try:
-                if (p.info["name"] or "").lower() == "firefox.exe":
-                    p.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-def close_firefox_gracefully(timeout_sec: int = FIREFOX_CLOSE_TIMEOUT_SEC) -> None:
-    for hwnd in _enum_firefox_windows():
-        try:
-            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-        except Exception:
-            pass
-
-    start = time.time()
-    while is_firefox_running() and (time.time() - start) < timeout_sec:
-        time.sleep(0.2)
-
-    if is_firefox_running():
-        for p in psutil.process_iter(["name"]):
-            try:
-                if (p.info["name"] or "").lower() == "firefox.exe":
-                    p.terminate()
-            except Exception:
-                pass
-
-        start = time.time()
-        while is_firefox_running() and (time.time() - start) < 5:
-            time.sleep(0.2)
-
-    if is_firefox_running():
-        hard_kill_firefox()
-        time.sleep(0.5)
-
-def wait_for_firefox_exit(timeout=10) -> bool:
-    end = time.time() + timeout
-    while time.time() < end:
-        if not is_firefox_running():
-            return True
-        time.sleep(0.2)
-    return False
-
-def launch_firefox(fx: Path) -> None:
-    try:
-        subprocess.Popen([str(fx)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print_info(f"Launching Firefox EXE: {fx}")
-    except Exception:
-        print_exc("launch_firefox")
-        if FAIL_FAST_ON_CRITICAL_ERRORS:
-            raise
-
-def verify_firefox_binary(expected: Path, timeout_sec: float = 6.0) -> None:
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        for p in psutil.process_iter(["name", "exe"]):
-            try:
-                if (p.info["name"] or "").lower() == "firefox.exe":
-                    exe = p.info.get("exe")
-                    if exe:
-                        running = Path(exe)
-                        print_info(f"Firefox running from: {running}")
-                        if running.resolve() != expected.resolve():
-                            print_warn("Running Firefox is NOT the expected EXE (policies may be ignored).")
-                        return
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-            except Exception:
-                pass
-        time.sleep(0.2)
-
-    print_warn("Could not verify Firefox process path (no firefox.exe process found).")
-
 
 # ============================================================
-# DISCORD KILL
+# OPTIONAL: close Discord once (no loop)
 # ============================================================
 
-def kill_discord() -> None:
-    if not KILL_DISCORD_APP:
+def close_discord_once() -> None:
+    if not CLOSE_DISCORD_ON_START:
         return
-    for p in psutil.process_iter(["name"]):
-        try:
-            if p.info["name"] in BLOCKED_PROCESSES:
-                p.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-        except Exception:
-            pass
+    try:
+        killed_any = False
+        for p in psutil.process_iter(["name"]):
+            try:
+                name = (p.info.get("name") or "")
+                if name in DISCORD_PROCESS_NAMES:
+                    p.terminate()
+                    killed_any = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if killed_any:
+            time.sleep(1.0)
+            for p in psutil.process_iter(["name"]):
+                try:
+                    name = (p.info.get("name") or "")
+                    if name in DISCORD_PROCESS_NAMES:
+                        p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            info("Discord was closed (once).")
+    except Exception:
+        err("close_discord_once")
 
 
 # ============================================================
-# CLEANUP / RECOVERY
+# STARTUP RECOVERY
 # ============================================================
 
-_POLICIES_PATH: Path | None = None
+def startup_recover_if_needed() -> None:
+    """
+    If previous run crashed, unblock on startup.
+    Conditions:
+    - session lock exists but worker PID not alive -> unblock
+    - stale heartbeat -> delete
+    """
+    try:
+        lock = read_session_lock()
+        if lock:
+            wpid = int(lock.get("worker_pid") or 0)
+            if wpid <= 0 or not psutil.pid_exists(wpid):
+                warn("Detected stale focus session (previous run didn't exit cleanly). Auto-unblocking...")
+                # aggressive unblock + dns flush
+                remove_all_focus_blocks()
+                flush_dns_cache_best_effort()
+                clear_session_lock()
+
+        if heartbeat_path().exists() and not is_heartbeat_fresh():
+            try:
+                heartbeat_path().unlink()
+            except Exception:
+                pass
+    except Exception:
+        err("startup_recover_if_needed (non-fatal)")
+
+
+# ============================================================
+# COMBINED WORKER+WATCHER PROCESS
+# ============================================================
+
 _CLEANED = False
-_FX_EXE: Path | None = None  # remember if we had Firefox
 
-def _close_and_clear_site_data_best_effort() -> None:
-    try:
-        close_firefox_gracefully()
-    except Exception:
-        print_exc("close_firefox_gracefully (non-fatal)")
-
-    try:
-        hard_kill_firefox()
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    try:
-        profile = firefox_default_profile_path()
-        clear_firefox_site_data(profile, SITE_DATA_DOMAINS)
-    except Exception:
-        print_exc("firefox_default_profile_path/clear_firefox_site_data (non-fatal)")
-
-def cleanup_and_optionally_restart() -> None:
-    global _POLICIES_PATH, _CLEANED, _FX_EXE
+def cleanup() -> None:
+    global _CLEANED
     if _CLEANED:
         return
     _CLEANED = True
 
-    # Firefox cleanup (only if Firefox exists/was used)
-    if _FX_EXE is not None:
-        _close_and_clear_site_data_best_effort()
-        wait_for_firefox_exit()
+    # Ensure unblock, even if backup is bad or markers are broken
+    restore_hosts_from_backup_best_effort()
+    flush_dns_cache_best_effort()
 
-        if _POLICIES_PATH is not None:
-            try:
-                restored = restore_from_backup(_POLICIES_PATH)
-                if restored:
-                    print_info("Restored Firefox policies.json to original state.")
-                else:
-                    print_info("No Firefox policy backup found to restore (nothing to do).")
-            except Exception:
-                print_exc("cleanup.restore_from_backup (non-fatal)")
-
-    # Reset hosts
-    if RESET_HOSTS_ON_EXIT:
-        try:
-            reset_hosts_to_default()
-            print_info("Reset hosts file to Windows default.")
-        except Exception:
-            print_exc("cleanup.reset_hosts_to_default (non-fatal)")
-
-    # Restart Firefox unblocked
-    if AUTO_RESTART_FIREFOX and _FX_EXE is not None:
-        try:
-            print_info("Restarting Firefox so the unblocked state takes effect...")
-            launch_firefox(_FX_EXE)
-            verify_firefox_binary(_FX_EXE)
-        except Exception:
-            print_exc("cleanup.launch_firefox (non-fatal)")
-
-def safe_recover_if_needed() -> None:
-    """
-    Best-effort recovery if previous run was interrupted.
-    - If Firefox exists, restore policy backup if present.
-    - Optionally reset hosts at startup (disabled by default).
-    """
-    fx = firefox_exe_path(optional=True)
-    if fx is not None:
-        try:
-            pp = firefox_policies_path(fx)
-            if restore_from_backup(pp):
-                print_info("Startup recovery: restored original Firefox policies from backup.")
-        except Exception:
-            print_exc("safe_recover_if_needed (non-fatal)")
-
-    if RESET_HOSTS_ON_START:
-        try:
-            reset_hosts_to_default()
-            print_info("Startup recovery: reset hosts to default (enabled).")
-        except Exception:
-            print_exc("safe_recover_hosts (non-fatal)")
-
-
-# ============================================================
-# WORKER PROCESS (does blocking + watchdog + optional timer)
-# ============================================================
-
-def _pid_alive(pid: int) -> bool:
+    # Clear signals/lock/heartbeat
     try:
-        if pid <= 0:
-            return False
-        return psutil.pid_exists(pid)
+        if stop_signal_path().exists():
+            stop_signal_path().unlink()
     except Exception:
-        return False
+        pass
+    try:
+        if heartbeat_path().exists():
+            heartbeat_path().unlink()
+    except Exception:
+        pass
+    clear_session_lock()
+    ding_stop()
+    info("FOCUS MODE OFF (cleanup complete).")
 
-def worker_main(parent_pid: int | None, duration_sec: int | None) -> int:
+def workerwatcher_main(ui_pid: int | None, duration_sec: int | None) -> int:
     """
-    Runs focus mode and watches for:
-      - stop signal file
-      - parent PID dying (Task Manager kill of UI)
-      - optional duration timer expiring (auto-stop)
-    On any event, runs cleanup and exits.
+    One process that:
+    - Applies hosts blocks
+    - Writes heartbeat + session lock
+    - Watches for:
+        * stop signal file
+        * UI PID dying (unexpected close/crash)
+        * optional timer expiring
+    Then cleans up and exits.
     """
-    force_utf8_stdout_best_effort()
-
-    global _POLICIES_PATH, _CLEANED, _FX_EXE
+    global _CLEANED
     _CLEANED = False
 
-    end_time: float | None = None
-    if duration_sec is not None and duration_sec > 0:
+    if os.name != "nt":
+        info("Windows only.")
+        return 1
+
+    if not is_admin():
+        info("Worker must be run as Administrator to edit hosts. Exiting.")
+        return 2
+
+    # Clear stop signal at start
+    try:
+        if stop_signal_path().exists():
+            stop_signal_path().unlink()
+    except Exception:
+        pass
+
+    # Register cleanup on normal interpreter exit
+    atexit.register(cleanup)
+
+    # Timer
+    end_time = None
+    if duration_sec and duration_sec > 0:
         end_time = time.time() + float(duration_sec)
 
     try:
-        if os.name != "nt":
-            print_info("Windows only.")
-            return 1
+        backup_hosts_once()
 
-        # Recovery in case last run died
-        safe_recover_if_needed()
-
-        # Clear any stale stop signal
-        try:
-            sp = stop_signal_path()
-            if sp.exists():
-                sp.unlink()
-        except Exception:
-            pass
-
-        # Determine Firefox availability (optional)
-        fx = firefox_exe_path(optional=True)
-        _FX_EXE = fx
-
-        if fx is None:
-            print_warn("Firefox not found. Running in HOSTS-ONLY mode (system-wide hosts blocking still applies).")
-        else:
-            print_info(f"Firefox detected: {fx}")
-
-        # Apply hosts blocks (system-wide)
-        backup_hosts()
+        # Apply blocks
         apply_hosts_block()
+        close_discord_once()
 
-        # If enabled, this wipes hosts (generally leave disabled)
-        if RESET_HOSTS_ON_START:
-            reset_hosts_to_default()
-            print_info("Reset hosts file to default at startup (enabled).")
+        # Write lock so startup recovery can detect crashes
+        write_session_lock(worker_pid=os.getpid(), ui_pid=ui_pid or 0)
 
-        # Firefox policies (only if Firefox exists)
-        if fx is not None:
-            policies_path = firefox_policies_path(fx)
-            _POLICIES_PATH = policies_path
-
-            # If prior run crashed, recover first
-            if restore_from_backup(policies_path):
-                print_info("Recovered from previous interrupted run (restored original policies).")
-
-            # Ensure Firefox is closed before enabling policy
-            _close_and_clear_site_data_best_effort()
-
-            backup_existing(policies_path)
-            write_policy(policies_path)
-
-        # Ensure cleanup on normal exit signals (won't run on hard-kill)
-        atexit.register(cleanup_and_optionally_restart)
-
-        print_info("FOCUS MODE ON (worker active)")
-        print_info("Worker will stop if UI requests stop, UI process is killed, or timer expires.")
-
+        info("FOCUS MODE ON (worker+watcher active).")
         if end_time is not None:
             mins = max(1, int(round(duration_sec / 60)))
-            print_info(f"Timer enabled: auto-stop after ~{mins} minute(s).")
-
-        if AUTO_RESTART_FIREFOX and fx is not None:
-            launch_firefox(fx)
-            verify_firefox_binary(fx)
+            info(f"Timer enabled: auto-stop after ~{mins} minute(s).")
 
         last_hb = 0.0
         while True:
-            # Discord kill loop
-            try:
-                kill_discord()
-            except Exception:
-                pass
-
             # Stop requested?
             try:
                 if stop_signal_path().exists():
-                    print_info("Stop signal detected. Stopping focus mode...")
+                    info("Stop signal detected. Stopping focus mode...")
                     break
             except Exception:
                 pass
 
             # Timer expired?
             if end_time is not None and time.time() >= end_time:
-                print_info("Timer expired. Auto-stopping focus mode...")
+                info("Timer expired. Auto-stopping focus mode...")
                 break
 
-            # Parent died? (e.g., UI killed in Task Manager)
-            if parent_pid is not None and parent_pid > 0:
-                if not _pid_alive(parent_pid):
-                    print_warn("UI process is gone (likely Task Manager close). Running cleanup...")
-                    break
+            # UI died unexpectedly?
+            if ui_pid and ui_pid > 0 and not psutil.pid_exists(ui_pid):
+                warn("UI process is gone (closed/crashed). Running cleanup...")
+                break
 
             # Heartbeat
             now = time.time()
             if now - last_hb >= HEARTBEAT_INTERVAL_SEC:
                 last_hb = now
-                try:
-                    heartbeat_path().write_text(str(int(now)), encoding="utf-8")
-                except Exception:
-                    pass
+                write_heartbeat()
 
-            time.sleep(1)
+            time.sleep(0.5)
 
     except Exception:
-        print("\nWORKER FATAL ERROR — ABORTING")
-        traceback.print_exc()
-        log("WORKER FATAL:\n" + traceback.format_exc())
+        err("workerwatcher_main")
     finally:
         try:
-            cleanup_and_optionally_restart()
+            cleanup()
         except Exception:
             pass
 
-        # best-effort cleanup artifacts
-        try:
-            if stop_signal_path().exists():
-                stop_signal_path().unlink()
-        except Exception:
-            pass
-        try:
-            if heartbeat_path().exists():
-                heartbeat_path().unlink()
-        except Exception:
-            pass
-
-    print_info("FOCUS MODE OFF (worker exited).")
     return 0
 
 
 # ============================================================
-# UI PROCESS
+# UI
 # ============================================================
 
 class FocusUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        force_utf8_stdout_best_effort()
 
-        self.title("Study Mode – Focus Blocker")
-        self.geometry("700x560")
-        self.minsize(700, 560)
+        self.title("Study Mode – Focus Blocker (failsafe)")
+        self.geometry("720x580")
+        self.minsize(720, 580)
 
-        self.log_q = queue.Queue()
         self._worker_proc: subprocess.Popen | None = None
         self._start_time: float | None = None
         self._end_time: float | None = None
 
+        self.log_q = queue.Queue()
         self._tail_stop = threading.Event()
         self._tail_offset = 0
 
@@ -864,10 +597,8 @@ class FocusUI(tk.Tk):
 
         self._build_ui()
 
-        # Tail log file so UI shows activity even when worker is elevated (no stdout pipe).
-        threading.Thread(target=self._tail_log_file, daemon=True).start()
-
-        self._poll_worker_output()
+        threading.Thread(target=self._tail_log, daemon=True).start()
+        self._poll_log()
         self._refresh_status()
 
     def _build_ui(self):
@@ -891,6 +622,9 @@ class FocusUI(tk.Tk):
         self.stop_btn = ttk.Button(controls, text="Stop Focus Mode", command=self.stop_focus)
         self.stop_btn.pack(side="left", padx=(10, 0))
 
+        self.restore_btn = ttk.Button(controls, text="Restore Now", command=self.restore_now)
+        self.restore_btn.pack(side="left", padx=(10, 0))
+
         timer_frame = ttk.Frame(self)
         timer_frame.pack(fill="x", **pad)
 
@@ -903,10 +637,15 @@ class FocusUI(tk.Tk):
 
         phrase_frame = ttk.Frame(self)
         phrase_frame.pack(fill="x", **pad)
-
         ttk.Label(phrase_frame, text=f"To stop, type exactly: {STOP_PHRASE}").pack(anchor="w")
         self.phrase_entry = ttk.Entry(phrase_frame)
         self.phrase_entry.pack(fill="x")
+
+        admin_frame = ttk.Frame(self)
+        admin_frame.pack(fill="x", **pad)
+
+        self.admin_var = tk.StringVar(value="")
+        ttk.Label(admin_frame, textvariable=self.admin_var, foreground="gray").pack(anchor="w")
 
         log_frame = ttk.LabelFrame(self, text="Activity Log")
         log_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -917,7 +656,7 @@ class FocusUI(tk.Tk):
 
         ttk.Label(
             self,
-            text="Tip: Worker needs Administrator to modify hosts and Firefox policies. If needed, it will prompt UAC.",
+            text=f"Files/logs stored in: {app_data_dir()}",
             foreground="gray"
         ).pack(anchor="w", padx=12, pady=(0, 10))
 
@@ -927,53 +666,8 @@ class FocusUI(tk.Tk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _worker_running(self) -> bool:
-        return self._worker_proc is not None and self._worker_proc.poll() is None
-
-    def _refresh_status(self):
-        running = self._worker_running()
-        # If we launched elevated via UAC, we won't have a Popen handle;
-        # In that case, infer running from heartbeat file presence.
-        hb_exists = heartbeat_path().exists()
-        inferred_running = running or hb_exists
-
-        self.status_var.set("Status: ON (Focus Mode Active)" if inferred_running else "Status: OFF")
-        self.start_btn.configure(state=("disabled" if inferred_running else "normal"))
-        self.stop_btn.configure(state=("normal" if inferred_running else "disabled"))
-
-        if inferred_running and self._start_time is not None:
-            if self._end_time is not None:
-                remaining = int(self._end_time - time.time())
-                if remaining < 0:
-                    remaining = 0
-                self.timer_var.set(f"Remaining: {remaining//60:02d}:{remaining%60:02d}")
-            else:
-                elapsed = int(time.time() - self._start_time)
-                self.timer_var.set(f"Running: {elapsed//60:02d}:{elapsed%60:02d}")
-        else:
-            self.timer_var.set("")
-            self._start_time = None
-            self._end_time = None
-
-        self.after(500, self._refresh_status)
-
-    def _poll_worker_output(self):
-        # Drain queued output from worker stdout thread (only when non-elevated Popen is used)
-        try:
-            while True:
-                msg = self.log_q.get_nowait()
-                self._append_log(msg)
-        except queue.Empty:
-            pass
-        self.after(200, self._poll_worker_output)
-
-    def _tail_log_file(self):
-        """
-        Tail app_blocker.log and stream to UI.
-        Works even when worker is elevated (no stdout pipe).
-        """
-        p = _default_log_path()
-        # Start tail at end to avoid dumping huge history
+    def _tail_log(self):
+        p = log_path()
         try:
             if p.exists():
                 self._tail_offset = p.stat().st_size
@@ -985,47 +679,91 @@ class FocusUI(tk.Tk):
                 if p.exists():
                     size = p.stat().st_size
                     if size < self._tail_offset:
-                        # log rotated/truncated
                         self._tail_offset = 0
                     if size > self._tail_offset:
                         with p.open("r", encoding="utf-8", errors="ignore") as f:
                             f.seek(self._tail_offset)
                             chunk = f.read()
                             self._tail_offset = f.tell()
-
-                        # Push new lines into the UI thread via queue
                         for line in chunk.splitlines():
                             if line.strip():
                                 self.log_q.put(line)
             except Exception:
                 pass
-
             time.sleep(0.25)
 
+    def _poll_log(self):
+        try:
+            while True:
+                msg = self.log_q.get_nowait()
+                self._append_log(msg)
+        except queue.Empty:
+            pass
+        self.after(200, self._poll_log)
+
+    def _worker_running(self) -> bool:
+        return self._worker_proc is not None and self._worker_proc.poll() is None
+
+    def _refresh_status(self):
+        hb_fresh = is_heartbeat_fresh()
+        running = self._worker_running() or hb_fresh
+
+        # self-heal stale heartbeat & stale session lock (UI convenience)
+        if heartbeat_path().exists() and not hb_fresh:
+            try:
+                heartbeat_path().unlink()
+            except Exception:
+                pass
+
+        lock = read_session_lock()
+        if lock:
+            wpid = int(lock.get("worker_pid") or 0)
+            if wpid and not psutil.pid_exists(wpid):
+                # stale lock
+                try:
+                    clear_session_lock()
+                except Exception:
+                    pass
+
+        self.status_var.set("Status: ON (Focus Mode Active)" if running else "Status: OFF")
+        self.start_btn.configure(state=("disabled" if running else "normal"))
+        self.stop_btn.configure(state=("normal" if running else "disabled"))
+
+        self.admin_var.set(
+            "Admin: YES (ok)" if is_admin() else "Admin: NO — run this program as Administrator to start focus mode."
+        )
+
+        if running and self._start_time is not None:
+            if self._end_time is not None:
+                remaining = int(self._end_time - time.time())
+                remaining = max(0, remaining)
+                self.timer_var.set(f"Remaining: {remaining//60:02d}:{remaining%60:02d}")
+            else:
+                elapsed = int(time.time() - self._start_time)
+                self.timer_var.set(f"Running: {elapsed//60:02d}:{elapsed%60:02d}")
+        else:
+            self.timer_var.set("")
+            self._start_time = None
+            self._end_time = None
+
+        self.after(500, self._refresh_status)
+
     def _parse_timer_minutes(self) -> int | None:
-        """
-        Returns:
-          None -> no timer (run indefinitely)
-          int  -> duration in seconds
-        """
         raw = (self.timer_entry.get() or "").strip()
         if not raw:
             return None
-
         try:
             minutes = float(raw)
         except ValueError:
             messagebox.showwarning("Invalid timer", "Timer must be a number of minutes (e.g., 25). Or leave blank.")
             return None
-
         if minutes <= 0:
             messagebox.showwarning("Invalid timer", "Timer must be > 0 minutes, or leave blank.")
             return None
-
         return int(round(minutes * 60))
 
     def _build_worker_cmd(self, duration_sec: int | None) -> list[str]:
-        base_args = ["--worker", "--parent-pid", str(os.getpid())]
+        base_args = ["--workwatch", "--ui-pid", str(os.getpid())]
         if duration_sec:
             base_args += ["--duration-sec", str(duration_sec)]
 
@@ -1035,15 +773,21 @@ class FocusUI(tk.Tk):
             return [sys.executable, str(Path(__file__).resolve())] + base_args
 
     def start_focus(self):
-        # avoid double-start
-        if self._worker_running() or heartbeat_path().exists():
+        if self._worker_running() or is_heartbeat_fresh():
             return
 
-        # Clear stop signal
+        if not is_admin():
+            messagebox.showwarning(
+                "Administrator required",
+                "To start focus mode, run this program as Administrator.\n\n"
+                "Right-click the .py/.exe and choose 'Run as administrator'."
+            )
+            return
+
+        # clear stop
         try:
-            sp = stop_signal_path()
-            if sp.exists():
-                sp.unlink()
+            if stop_signal_path().exists():
+                stop_signal_path().unlink()
         except Exception:
             pass
 
@@ -1051,58 +795,29 @@ class FocusUI(tk.Tk):
         if (self.timer_entry.get() or "").strip() and duration_sec is None:
             return
 
-        worker_cmd = self._build_worker_cmd(duration_sec)
+        cmd = self._build_worker_cmd(duration_sec)
+        self._append_log("Starting focus mode..." + (" (timer enabled)" if duration_sec else ""))
 
-        self._append_log("Starting focus mode worker..." + (" (timer enabled)" if duration_sec else ""))
-
-        # Worker needs admin to edit hosts (and Firefox policies if present)
-        if not is_admin():
-            ok = relaunch_elevated(worker_cmd)
-            if ok:
-                self._append_log("Worker launched as Administrator (UAC).")
-                self._start_time = time.time()
-                self._end_time = (self._start_time + duration_sec) if duration_sec else None
-                # No Popen handle in elevated path; log tail will show activity.
-                self._worker_proc = None
-                return
-            else:
-                self._append_log("Failed to elevate worker. Try running this app as Administrator.")
-                return
-
-        # Already admin: launch and capture stdout
         try:
             self._worker_proc = subprocess.Popen(
-                worker_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(app_data_dir()),
             )
+            write_session_lock(worker_pid=self._worker_proc.pid, ui_pid=os.getpid())
             self._start_time = time.time()
             self._end_time = (self._start_time + duration_sec) if duration_sec else None
-            threading.Thread(target=self._read_worker_stdout, daemon=True).start()
+            info("UI started worker+watcher.")
         except Exception as e:
             self._append_log(f"Failed to start worker: {e}")
             self._worker_proc = None
-            self._start_time = None
-            self._end_time = None
-
-    def _read_worker_stdout(self):
-        try:
-            if not self._worker_proc or not self._worker_proc.stdout:
-                return
-            for line in self._worker_proc.stdout:
-                if line.strip():
-                    self.log_q.put(line.rstrip())
-        except Exception as e:
-            self.log_q.put(f"(UI) Worker output read error: {e}")
 
     def _stop_phrase_ok(self) -> bool:
         return self.phrase_entry.get().strip() == STOP_PHRASE
 
     def stop_focus(self):
-        if not (self._worker_running() or heartbeat_path().exists()):
+        if not (self._worker_running() or is_heartbeat_fresh()):
             return
 
         if REQUIRE_STOP_PHRASE and not self._stop_phrase_ok():
@@ -1117,53 +832,63 @@ class FocusUI(tk.Tk):
         except Exception as e:
             self._append_log(f"Failed to write stop signal: {e}")
 
-        self._append_log("Stop requested. Waiting for worker to exit...")
+        self._append_log("Stop requested. Waiting for cleanup...")
         self.phrase_entry.delete(0, "end")
 
+    def restore_now(self):
+        if messagebox.askyesno("Restore", "Force unblock now (aggressive) and flush DNS?"):
+            try:
+                try:
+                    stop_signal_path().write_text("stop", encoding="utf-8")
+                except Exception:
+                    pass
+                restore_hosts_from_backup_best_effort()
+                flush_dns_cache_best_effort()
+                clear_session_lock()
+                self._append_log("Restore/unblock complete.")
+            except Exception as e:
+                self._append_log(f"Restore failed: {e}")
+
     def on_close(self):
-        if self._worker_running() or heartbeat_path().exists():
+        # If focus is on, request stop
+        if self._worker_running() or is_heartbeat_fresh():
             if not messagebox.askyesno(
                 "Stop Focus Mode?",
                 "Focus Mode is ON.\n\nClosing will STOP focus mode and restore browsing.\n\nStop and close?"
             ):
                 return
-
             try:
                 stop_signal_path().write_text("stop", encoding="utf-8")
-            except Exception as e:
-                self._append_log(f"Failed to write stop signal: {e}")
+            except Exception:
+                pass
 
-            self._append_log("Close requested. Waiting for worker cleanup...")
-
-            deadline = time.time() + 20
-            while heartbeat_path().exists() and time.time() < deadline:
+            deadline = time.time() + 10
+            while is_heartbeat_fresh() and time.time() < deadline:
                 self.update()
                 time.sleep(0.2)
-
-            if heartbeat_path().exists():
-                self._append_log("Worker still running; closing UI anyway (worker should still cleanup shortly).")
 
         self._tail_stop.set()
         self.destroy()
 
 
 # ============================================================
-# ENTRYPOINT + ARG PARSING
+# ARG PARSING / ENTRYPOINT
 # ============================================================
 
 def parse_args(argv: list[str]) -> dict:
-    out = {"mode": "ui", "parent_pid": None, "duration_sec": None}
-    if "--worker" in argv:
-        out["mode"] = "worker"
+    out = {"mode": "ui", "ui_pid": None, "duration_sec": None}
+
+    if "--workwatch" in argv:
+        out["mode"] = "workwatch"
     if "--restore" in argv:
         out["mode"] = "restore"
 
-    if "--parent-pid" in argv:
+    if "--ui-pid" in argv:
         try:
-            i = argv.index("--parent-pid")
-            out["parent_pid"] = int(argv[i + 1])
+            i = argv.index("--ui-pid")
+            out["ui_pid"] = int(argv[i + 1])
         except Exception:
-            out["parent_pid"] = None
+            out["ui_pid"] = None
 
     if "--duration-sec" in argv:
         try:
@@ -1175,26 +900,15 @@ def parse_args(argv: list[str]) -> dict:
     return out
 
 def restore_only() -> int:
-    """
-    Manual restore mode:
-      python app_blocker.py --restore
-    Useful if you ever hard-kill BOTH processes and need cleanup.
-    """
-    force_utf8_stdout_best_effort()
     try:
-        fx = firefox_exe_path(optional=True)
-        global _POLICIES_PATH, _CLEANED, _FX_EXE
-        _CLEANED = False
-        _FX_EXE = fx
-        if fx is not None:
-            _POLICIES_PATH = firefox_policies_path(fx)
-        else:
-            _POLICIES_PATH = None
-        cleanup_and_optionally_restart()
-        print_info("Restore complete.")
+        info("Manual restore requested (aggressive unblock).")
+        restore_hosts_from_backup_best_effort()
+        flush_dns_cache_best_effort()
+        clear_session_lock()
+        info("Restore complete.")
         return 0
     except Exception:
-        print_exc("restore_only")
+        err("restore_only")
         return 1
 
 def main():
@@ -1203,23 +917,18 @@ def main():
     if args["mode"] == "restore":
         sys.exit(restore_only())
 
-    if args["mode"] == "worker":
-        parent_pid = args.get("parent_pid")
-        duration_sec = args.get("duration_sec")
-        sys.exit(worker_main(parent_pid, duration_sec))
+    if args["mode"] == "workwatch":
+        sys.exit(workerwatcher_main(args.get("ui_pid"), args.get("duration_sec")))
 
     # UI mode
     try:
+        info(f"UI started. Artifacts in: {app_data_dir()}")
+        startup_recover_if_needed()
         app = FocusUI()
         app.mainloop()
     except Exception:
-        print("\nUI FATAL ERROR — PROGRAM ABORTED")
-        traceback.print_exc()
-        log("UI FATAL:\n" + traceback.format_exc())
-        if getattr(sys, "frozen", False):
-            input("\nPress ENTER to exit...")
+        err("UI mainloop")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
